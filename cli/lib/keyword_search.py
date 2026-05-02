@@ -1,27 +1,123 @@
+import math
+import os
+import pickle
 import string
+from collections import Counter, defaultdict
 
-from .search_utils import DEFAULT_SEARCH_LIMIT, load_movies, load_stopwords
 from nltk.stem import PorterStemmer
+
+from .search_utils import (
+    CACHE_DIR,
+    DEFAULT_SEARCH_LIMIT,
+    load_movies,
+    load_stopwords,
+)
+
+
+class InvertedIndex:
+    def __init__(self) -> None:
+        self.index = defaultdict(set)
+        self.docmap: dict[int, dict] = {}
+        self.term_frequencies: dict[int, Counter] = defaultdict(Counter)
+        self.index_path = os.path.join(CACHE_DIR, "index.pkl")
+        self.docmap_path = os.path.join(CACHE_DIR, "docmap.pkl")
+        self.term_frequencies_path = os.path.join(CACHE_DIR, "term_frequencies.pkl")
+
+    def build(self) -> None:
+        movies = load_movies()
+        for m in movies:
+            doc_id = m["id"]
+            doc_description = f"{m['title']} {m['description']}"
+            self.docmap[doc_id] = m
+            self.__add_document(doc_id, doc_description)
+
+    def save(self) -> None:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(self.index_path, "wb") as f:
+            pickle.dump(self.index, f)
+        with open(self.docmap_path, "wb") as f:
+            pickle.dump(self.docmap, f)
+        with open(self.term_frequencies_path, "wb") as f:
+            pickle.dump(self.term_frequencies, f)
+
+    def get_documents(self, term: str) -> list[int]:
+        doc_ids = self.index.get(term, set())
+        return sorted(list(doc_ids))
+
+    def __add_document(self, doc_id: int, text: str) -> None:
+        tokens = tokenize_text(text)
+        for token in set(tokens):
+            self.index[token].add(doc_id)
+        for token in tokens:
+            self.term_frequencies[doc_id][token] += 1
+
+    def load(self) -> None:
+        with open(self.index_path, "rb") as f:
+            self.index = pickle.load(f)
+        with open(self.docmap_path, "rb") as f:
+            self.docmap = pickle.load(f)
+        with open(self.term_frequencies_path, "rb") as f:
+            self.term_frequencies = pickle.load(f)
+
+    def get_idf(self, term: str) -> float:
+        tokens = tokenize_text(term)
+        if len(tokens) > 1:
+            raise ValueError(f"Expected a single token, got {len(tokens)}: {tokens}")
+        if not tokens:
+            return 0.0
+        token = tokens[0]
+        n = len(self.docmap)
+        df = len(self.index.get(token, set()))
+        if df == 0:
+            return 0.0
+        return math.log(n / (df + 1))
+
+    def get_tf(self, doc_id: int, term: str) -> int:
+        tokens = tokenize_text(term)
+        if len(tokens) > 1:
+            raise ValueError(f"Expected a single token, got {len(tokens)}: {tokens}")
+        if not tokens:
+            return 0
+        token = tokens[0]
+        return self.term_frequencies.get(doc_id, Counter()).get(token, 0)
+
+
+def idf_command(term: str) -> float:
+    index = InvertedIndex()
+    index.load()
+    return index.get_idf(term)
+
+
+def tf_command(doc_id: int, term: str) -> int:
+    index = InvertedIndex()
+    index.load()
+    return index.get_tf(doc_id, term)
+
+
+def build_command() -> None:
+    idx = InvertedIndex()
+
+    idx.build()
+    idx.save()
+    
 
 
 def search_command(query: str, limit: int = DEFAULT_SEARCH_LIMIT) -> list[dict]:
-    stemmer = PorterStemmer()
-    movies = load_movies()
-    stopwords = load_stopwords()
+    index = InvertedIndex()
+    index.load()
 
-    results = []
-    for movie in movies:
-        query_tokens = tokenize_text(query)
-        clean_query_tokens = remove_stopwords(query_tokens, stopwords)
-        title_tokens = tokenize_text(movie["title"])
-        clean_title_tokens = remove_stopwords(title_tokens, stopwords)
-
-        stemmered_query_tokens = [stemmer.stem(token) for token in clean_query_tokens]
-
-        if has_matching_token(stemmered_query_tokens, clean_title_tokens):
-            results.append(movie)
+    query_tokens = tokenize_text(query)
+    seen, results = set(), []
+    for query_token in query_tokens:
+        matching_doc_ids = index.get_documents(query_token)
+        for doc_id in matching_doc_ids:
+            if doc_id in seen:
+                continue
+            seen.add(doc_id)
+            doc = index.docmap[doc_id]
+            results.append(doc)
             if len(results) >= limit:
-                break
+                return results
 
     return results
 
@@ -47,10 +143,14 @@ def tokenize_text(text: str) -> list[str]:
     for token in tokens:
         if token:
             valid_tokens.append(token)
-    return valid_tokens
-
-def remove_stopwords(tokens: list[str], stopwords: set[str]) -> list[str]:
-    return [token for token in tokens if token not in stopwords]
-
-
+    stop_words = load_stopwords()
+    filtered_words = []
+    for word in valid_tokens:
+        if word not in stop_words:
+            filtered_words.append(word)
+    stemmer = PorterStemmer()
+    stemmed_words = []
+    for word in filtered_words:
+        stemmed_words.append(stemmer.stem(word))
+    return stemmed_words
 
